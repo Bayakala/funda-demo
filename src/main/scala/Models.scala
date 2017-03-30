@@ -54,6 +54,29 @@ object Models {
 
   val AQMRPTQuery = TableQuery[AQMRPTTable]
 
+  case class NORMAQMModel(rid: Long
+                         , mid: Int
+                         , state: Int
+                         , county: Int
+                         , year: Int
+                         , value: Int
+                         , average: Int
+                         ) extends FDAROW
+
+  class NORMAQMTable(tag: Tag) extends Table[NORMAQMModel](tag, "NORMAQM") {
+    def rid = column[Long]("ROWID",O.AutoInc,O.PrimaryKey)
+    def mid = column[Int]("MEASUREID")
+    def state = column[Int]("STATID")
+    def county = column[Int]("COUNTYID")
+    def year = column[Int]("REPORTYEAR")
+    def value = column[Int]("VALUE")
+    def average = column[Int]("AVG")
+
+    def * = (rid,mid,state,county,year,value,average) <> (NORMAQMModel.tupled, NORMAQMModel.unapply)
+  }
+
+
+  val NORMAQMQuery = TableQuery[NORMAQMTable]
 
   case class StateModel(id: Int, name: String) extends FDAROW
   class StateTable(tag: Tag) extends Table[StateModel](tag,"STATE") {
