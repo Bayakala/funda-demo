@@ -10,7 +10,7 @@ import slick.jdbc.H2Profile.api._
 import Models._
 import fs2.Strategy
 
-object ParallelTasks extends App {
+object ParallelExecution extends App {
 
   val db = Database.forConfig("h2db")
 
@@ -101,18 +101,13 @@ object ParallelTasks extends App {
     id
   }
 
-  //original table listing
-  implicit def toAQMRPT(row: AQMRPTTable#TableElementType) =
-    AQMRPTModel(row.rid,row.mid,row.state,row.county,row.year,row.value,row.total,row.valid)
-  val AQMRPTLoader = FDAStreamLoader(slick.jdbc.H2Profile)(toAQMRPT _)
-  val AQMRPTStream = AQMRPTLoader.fda_typedStream(AQMRPTQuery.result)(db)(256,256)()
-
+  //process input row and produce action row to insert into NORMAQM
   def getIdsThenInsertAction: FDAUserTask[FDAROW] = row => {
     row match {
       case aqm: AQMRPTModel =>
         if (aqm.valid) {
-          val stateId = 0 //getStateID(aqm.state)
-          val countyId = 0 //getCountyID(aqm.state,aqm.county)
+          val stateId = getStateID(aqm.state)
+          val countyId = getCountyID(aqm.state,aqm.county)
           val action = NORMAQMQuery += NORMAQMModel(0,aqm.mid, stateId, countyId, aqm.year,aqm.value,aqm.total)
           fda_next(FDAActionRow(action))
         }
@@ -120,40 +115,85 @@ object ParallelTasks extends App {
       case _ => fda_skip
     }
   }
+  //runner for the action rows
   val runner = FDAActionRunner(slick.jdbc.H2Profile)
   def runInsertAction: FDAUserTask[FDAROW] = row =>
-   row match {
-    case FDAActionRow(action) =>
-      runner.fda_execAction(action)(db)
-      fda_skip
-    case _ => fda_skip
+    row match {
+      case FDAActionRow(action) =>
+        runner.fda_execAction(action)(db)
+        fda_skip
+      case _ => fda_skip
+    }
+
+  //create parallel sources
+  //get a stream of years
+  val qryYears = AQMRPTQuery.map(_.year).distinct
+  case class Years(year: Int) extends FDAROW
+
+  implicit def toYears(y: Int) = Years(y)
+
+  val yearViewLoader = FDAViewLoader(slick.jdbc.H2Profile)(toYears _)
+  val yearSeq = yearViewLoader.fda_typedRows(qryYears.result)(db).toSeq
+  val yearStream = fda_staticSource(yearSeq)()
+
+  //strong row type
+  implicit def toAQMRPT(row: AQMRPTTable#TableElementType) =
+    AQMRPTModel(row.rid, row.mid, row.state, row.county, row.year, row.value, row.total, row.valid)
+
+  //shared stream loader when operate in parallel mode
+  val AQMRPTLoader = FDAStreamLoader(slick.jdbc.H2Profile)(toAQMRPT _)
+
+  //loading rows with year yr
+  def loadRowsInYear(yr: Int) = {
+    //a new query
+    val query = AQMRPTQuery.filter(row => row.year === yr)
+    //reuse same loader
+    AQMRPTLoader.fda_typedStream(query.result)(db)(256, 256)(println(s"End of stream ${yr}!!!!!!"))
   }
 
+  //loading rows by year
+  def loadRowsByYear: FDASourceLoader = row => {
+    row match {
+      case Years(y) => loadRowsInYear(y) //produce stream of the year
+      case _ => fda_appendRow(FDANullRow)
+    }
+
+  }
+
+
+  //start counter
   val cnt_start = System.currentTimeMillis()
-/*
-    AQMRPTStream.take(100000)
-      .appendTask(getIdsThenInsertAction)
-      .appendTask(runInsertAction)
-      .startRun
-    //println(s"processing 10000 rows in a single thread in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-    //processing 10000 rows in a single thread in 570 seconds
-    //println(s"processing 20000 rows in a single thread in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-    //processing 20000 rows in a single thread in 1090 seconds
-    //println(s"processing 100000 rows in a single thread in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-    //processing 100000 rows in a single thread in 2+ hrs
-*/
 
-  // implicit val strategy = Strategy.fromCachedDaemonPool("cachedPool")
-//      implicit val strategy = Strategy.fromFixedDaemonPool(6)
-      fda_runPar(AQMRPTStream.toPar(getIdsThenInsertAction))(4)
-        .appendTask(runInsertAction)
-        .startRun
+  def showRecord: FDAUserTask[FDAROW] = row => {
+    row match {
+      case Years(y) => println(y); fda_skip
+      case aqm: AQMRPTModel =>
+        println(s"${aqm.year}  $aqm")
+        fda_next(aqm)
+      case FDAActionRow(action) =>
+        println(s"${action}")
+        fda_skip
+      case _ => fda_skip
+    }
+  }
 
-      //println(s"processing 10000 rows parallelly  in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-      // processing 10000 rows parallelly  in 316 seconds
-      //println(s"processing 20000 rows parallelly  in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-      //processing 20000 rows parallelly  in 614 seconds
-      println(s"processing 100000 rows parallelly  in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
-      //processing 100000 rows parallelly  in 3885 seconds
+  //the following is a process of composition of stream combinators
+  //get parallel source constructor
+  val parSource = yearStream.toParSource(loadRowsByYear)
+  //implicit val strategy = Strategy.fromCachedDaemonPool("cachedPool")
+  //produce a stream from parallel sources
+  val source = fda_par_source(parSource)(4)
+  //turn getIdsThenInsertAction into parallel task
+  val parTasks = source.toPar(getIdsThenInsertAction)
+  //runPar to produce a new stream
+  val actionStream =fda_runPar(parTasks)(4)
+  //turn runInsertAction into parallel task
+  val parRun = actionStream.toPar(runInsertAction)
+  //runPar and carry out by startRun
+  fda_runPar(parRun)(4).startRun
+
+  println(s"processing 219400 rows parallelly  in ${(System.currentTimeMillis - cnt_start)/1000} seconds")
+
+
 
 }

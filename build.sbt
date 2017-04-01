@@ -1,6 +1,6 @@
 name := "funda-demo"
 
-version := "1.7"
+version := "1.8"
 
 scalaVersion := "2.11.8"
 
