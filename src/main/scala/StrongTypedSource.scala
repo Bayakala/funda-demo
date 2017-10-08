@@ -2,11 +2,11 @@ import slick.jdbc.H2Profile.api._
 import scala.language.implicitConversions
 import com.bayakala.funda._
 import api._
-import Models._
+import com.bayakala.funda.samples._
 
 object StrongTypedSource extends App {
 
-  val aqmraw =  AQMRawQuery
+  val aqmraw =  SlickModels.AQMRawQuery
 
   val db = Database.forConfig("h2db")
   // aqmQuery.result returns Seq[(String,String,String,String)]
@@ -53,21 +53,52 @@ object StrongTypedSource extends App {
       case _ => fda_skip
     }
   }
+
   //first convert to StateRows to turn Stream[Task,FDAROW] typed stream
   stateStream.map{s => StateRow(s)}
     .filter{r => r.state > "Alabama"}.take(3)
     .appendTask(showState).startRun
 
 
+
+  //KillSwitch.killNow
+  object killer extends Fs2Terminator
+
   val streamLoader = FDAStreamLoader(slick.jdbc.H2Profile)(toTypedRow _)
-  val streamSource = streamLoader.fda_typedStream(aqmQuery.result)(db)(512,512)()
-  streamSource.filter{r => r.year > "1999"}.take(3).appendTask(showRecord).startRun
+  val streamSource = streamLoader.fda_typedStream(aqmQuery.result)(db)(512,16)()(killer)
+  //  streamSource.filter{r => r.year > "1999"}.appendTask(showRecord).startRun
+  streamSource
+    .map {row => row match {
+      case qmr: TypedRow if (qmr.value.toString == "5") =>
+        killer.stopASAP
+        qmr
+      case _ => row }}
+    .appendTask(showRecord)
+    .startRun
+
 
   val stateStreamLoader = FDAStreamLoader[String,String](slick.jdbc.H2Profile)()
-  val stateStreamSource = stateStreamLoader.fda_plainStream(allState.distinct.result)(db)(512,512)()
+  val stateStreamSource = stateStreamLoader.fda_plainStream(allState.distinct.result)(db)(512,512,30)()
 
   //first convert to StateRows to turn Stream[Task,FDAROW] typed stream
   stateStreamSource.map{s => StateRow(s)}
     .filter{r => r.state > "Alabama"}.take(3)
     .appendTask(showState).startRun
+
+  val akkaStreamLoader = FDAStreamLoader(slick.jdbc.H2Profile)(toTypedRow _)
+  val akkaStreamSource = akkaStreamLoader.fda_akkaTypedStream(aqmQuery.result)(db)(512,512,30)()()
+  akkaStreamSource     //.filter{r => r.year > "1999"}
+    .appendTask(showRecord).startRun
+
+  val akkaStreamSource2 = akkaStreamLoader.fda_akkaTypedStream(aqmQuery.result)(db)(512,1)()()
+  akkaStreamSource2
+    .map {row => row match {
+      case qmr: TypedRow if (qmr.value.toString == "5") =>
+        AkkaKillSwitch.stopASAP
+        qmr
+      case _ => row }}
+    .appendTask(showRecord)
+    .startRun
+
+
 }
